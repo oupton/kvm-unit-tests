@@ -2724,7 +2724,9 @@ static void ept_reserved_bit(int bit)
 }
 
 #define PAGE_2M_ORDER 9
+#define PAGE_2M_SIZE (PAGE_SIZE * PAGE_2M_ORDER)
 #define PAGE_1G_ORDER 18
+#define PAGE_1G_SIZE (PAGE_SIZE * PAGE_1G_ORDER)
 
 static void *get_1g_page(void)
 {
@@ -2811,6 +2813,72 @@ static void ept_access_test_setup(void)
 	memcpy(&data->hva[1], &ret42_start, &ret42_end - &ret42_start);
 }
 
+static int setup_pae(void)
+{
+	return vmcs_write(ENT_CONTROLS, vmcs_read(ENT_CONTROLS)
+			& ~ENT_GUEST_64 & ~ENT_LOAD_EFER) ||
+		vmcs_write(GUEST_CR4, (vmcs_read(GUEST_CR4) & ~X86_CR4_PCIDE)
+				| X86_CR4_PAE);
+}
+
+static void ept_pae_access_test_setup(void)
+{
+	struct ept_access_test_data *data = &ept_access_test_data;
+	unsigned long *page_table = current_page_table();
+	unsigned long *guest_cr3;
+	unsigned long *tmp_va;
+	unsigned long pte;
+	unsigned long *search;
+
+	if (setup_ept(false))
+		test_skip("EPT not supported");
+
+	/* We use data->gpa = 1 << 39 so that test data has a separate pml4 entry */
+	if (cpuid_maxphyaddr() < 40)
+		test_skip("Test needs MAXPHYADDR >= 40");
+
+	TEST_ASSERT(setup_pae());
+	test_set_guest(ept_access_test_guest);
+	test_add_teardown(ept_access_test_teardown, NULL);
+
+	data->hva = get_1g_page();
+	TEST_ASSERT(data->hva);
+	data->hpa = virt_to_phys(data->hva);
+
+	data->gpa = 1ul << 39;
+	tmp_va = (void *) ALIGN((unsigned long) alloc_vpages(PAGE_2M_SIZE * 2),
+				PAGE_2M_SIZE);
+	TEST_ASSERT(!any_present_pages(page_table, tmp_va, PAGE_2M_SIZE));
+	install_pages(page_table, data->gpa, PAGE_2M_SIZE, tmp_va);
+
+	data->gva = (void *) (((u64) tmp_va) & ((u32) ~0ul));
+	/*
+	 * Setup code for creating the PAE guest's page tables. Initialize a page as
+	 * a PAE Page Directory Pointer Table, which is a 32-byte aligned table of four
+	 * PDPTEs.
+	 *
+	 * We want to grab the executable's address space as well as the test data.
+	 */
+	guest_cr3 = alloc_page();
+	TEST_ASSERT(guest_cr3);
+	memset(guest_cr3, 0, PAGE_SIZE);
+	search = get_pte_level(page_table, data, 2);
+	guest_cr3[0] = *search;
+	search = get_pte_level(page_table, data->gva, 2);
+	guest_cr3[3] = *search;
+	vmcs_write(GUEST_CR3, (u64) guest_cr3);
+	/*
+	 * Make sure nothing's mapped here so the tests that screw with the
+	 * pml4 entry don't inadvertently break something.
+	 */
+	TEST_ASSERT(get_ept_pte(pml4, data->gpa, 4, &pte) && pte == 0);
+	TEST_ASSERT(get_ept_pte(pml4, data->gpa + PAGE_2M_SIZE - 1, 4, &pte) && pte == 0);
+	install_ept(pml4, data->hpa, data->gpa, EPT_PRESENT);
+
+	data->hva[0] = MAGIC_VAL_1;
+	memcpy(&data->hva[1], &ret42_start, &ret42_end - &ret42_start);
+}
+
 static void ept_access_test_not_present(void)
 {
 	ept_access_test_setup();
@@ -2882,7 +2950,7 @@ static void ept_access_test_write_execute(void)
 
 static void ept_access_test_read_write_execute(void)
 {
-	ept_access_test_setup();
+	ept_pae_access_test_setup();
 	/* rwx */
 	ept_access_allowed(EPT_RA | EPT_WA | EPT_EA, OP_READ);
 	ept_access_allowed(EPT_RA | EPT_WA | EPT_EA, OP_WRITE);
